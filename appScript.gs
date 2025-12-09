@@ -23,7 +23,6 @@
 // Maximum number of pages to fetch from zkillboard (zkillboard max is 20 pages)
 // Change this value for debugging/testing purposes
 const MAX_PAGES = 20;
-const CHARACTER_ID = '2119131489'; // Jeff Kali for testing - has around 100 solo kills
 
 // API and processing timing constants (in milliseconds)
 const API_CALL_PAUSE_MS = 100;      // Pause between API calls
@@ -80,6 +79,56 @@ const ZKILL_SHEET_HEADERS = [
   "final_blow_ship_type_id",
   "final_blow_ship_name"    // from CSV reference data
 ];
+
+// ============================================================================
+// CHARACTER ID MANAGEMENT
+// ============================================================================
+
+/**
+ * Gets the character ID from cell A2 in the 'setup' sheet
+ * Extracts character ID from various URL formats (zkillboard, evewho, or plain number)
+ * @return {string} Character ID as a string
+ * @throws {Error} If setup sheet or cell A2 is missing/invalid
+ */
+function getCharacterIdFromSetup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const setupSheet = ss.getSheetByName('setup');
+  
+  if (!setupSheet) {
+    throw new Error('Setup sheet not found. Please create a "setup" sheet with character URL in cell A2.');
+  }
+  
+  const linkCell = setupSheet.getRange('A2');
+  const linkValue = linkCell.getValue();
+  
+  if (!linkValue || linkValue === '') {
+    throw new Error('A2 in setup sheet is empty. Please add a character URL (e.g., https://zkillboard.com/character/1234567890/) to cell A2.');
+  }
+  
+  // Extract character ID from various URL formats:
+  // https://zkillboard.com/character/1234567890/
+  // https://zkillboard.com/character/1234567890
+  // https://evewho.com/character/1234567890
+  // Or just the ID itself
+  
+  const urlPatterns = [
+    /zkillboard\.com\/character\/(\d+)/,
+    /evewho\.com\/character\/(\d+)/,
+    /character\/(\d+)/,
+    /^(\d+)$/  // Just a plain number
+  ];
+  
+  for (const pattern of urlPatterns) {
+    const match = linkValue.toString().match(pattern);
+    if (match && match[1]) {
+      const characterId = match[1];
+      Logger.log(`Extracted character ID from setup sheet: ${characterId}`);
+      return characterId;
+    }
+  }
+  
+  throw new Error(`Could not extract character ID from "${linkValue}". Please ensure A2 contains a valid character URL or ID.`);
+}
 
 // ============================================================================
 // MAIN FUNCTIONS
@@ -180,13 +229,16 @@ function fetchZkillInitial() {
   Logger.log("Loading reference data from CSV sheets...");
   const referenceMaps = loadReferenceDataMaps();
   
+  // Get character ID from setup sheet
+  const characterId = getCharacterIdFromSetup();
+  
   let pagesProcessed = 0;
   let totalKillmailsAdded = 0;
   let totalSkipped = 0;
   let yearMonthCombosProcessed = 0;
   
   // Generate year/month combinations from current date back to character's birthday
-  const yearMonthCombinations = generateYearMonthCombinations(CHARACTER_ID);
+  const yearMonthCombinations = generateYearMonthCombinations(characterId);
   Logger.log(`Processing ${yearMonthCombinations.length} year/month combinations (from current to character's birthday)`);
   
   // Loop through each year/month combination
@@ -201,7 +253,7 @@ function fetchZkillInitial() {
       Logger.log(`Fetching ${year}-${month.toString().padStart(2, '0')} page ${page}...`);
       
       // Fetch zkill data for this page with year/month filter
-      const zkillPageResult = fetchZKillboardPage(CHARACTER_ID, page, year, month);
+      const zkillPageResult = fetchZKillboardPage(characterId, page, year, month);
       const zkillPageData = zkillPageResult.rows;
       
       // Pause between API calls
@@ -313,6 +365,9 @@ function fetchZkillUpdate() {
   Logger.log("Loading reference data from CSV sheets...");
   const referenceMaps = loadReferenceDataMaps();
   
+  // Get character ID from setup sheet
+  const characterId = getCharacterIdFromSetup();
+  
   // Get existing killmail IDs from the sheet
   const existingIds = getExistingKillmailIds(sheet);
   Logger.log(`Found ${existingIds.size} existing killmails in sheet`);
@@ -323,7 +378,7 @@ function fetchZkillUpdate() {
   
   // Generate year/month combinations from current date going backwards
   // Will stop when an existing killmail is found
-  const yearMonthCombinations = generateYearMonthCombinations(CHARACTER_ID);
+  const yearMonthCombinations = generateYearMonthCombinations(characterId);
   Logger.log(`Checking months for new killmails (will stop when existing killmail is found)`);
   
   // Loop through year/month combinations (newest first)
@@ -338,7 +393,7 @@ function fetchZkillUpdate() {
       Logger.log(`Checking ${year}-${month.toString().padStart(2, '0')} page ${page}...`);
       
       // Fetch zkill data for this page with year/month filter
-      const zkillPageResult = fetchZKillboardPage(CHARACTER_ID, page, year, month);
+      const zkillPageResult = fetchZKillboardPage(characterId, page, year, month);
       const zkillPageData = zkillPageResult.rows;
       
       // Pause between API calls
