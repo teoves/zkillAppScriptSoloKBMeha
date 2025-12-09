@@ -32,6 +32,23 @@ const SHEET_WRITE_PAUSE_MS = 100;    // Pause between sheet writes
 // ESI API batch processing
 const ESI_BATCH_SIZE = 50;           // Number of killmails to process per ESI API batch
 
+// ESI API headers
+const ESI_HEADERS = {
+  "User-Agent": "GoogleAppsScript-Meha Taredi's Looker Studio Solo killboard"
+};
+
+const ZKILLBOARD_HEADERS = {
+  "User-Agent": "GoogleAppsScript-Meha Taredi's Looker Studio Solo killboard"
+};
+
+// CSV reference data URLs
+const CSV_URLS = {
+  solar: "https://www.fuzzwork.co.uk/dump/latest/mapSolarSystems.csv",
+  regions: "https://www.fuzzwork.co.uk/dump/latest/mapRegions.csv",
+  invTypes: "https://www.fuzzwork.co.uk/dump/latest/invTypes.csv",
+  invGroups: "https://www.fuzzwork.co.uk/dump/latest/invGroups.csv"
+};
+
 // Combined headers for zkill sheet: zkill data + ESI details + reference data
 const ZKILL_SHEET_HEADERS = [
   // zkill columns (from zkillboard API)
@@ -407,9 +424,7 @@ function fetchZKillboardPage(characterID, pageNum, year, month) {
   try {
     const response = UrlFetchApp.fetch(API_URL, {
       "muteHttpExceptions": true,
-      "headers": {
-        "User-Agent": "GoogleAppsScript-zKillboardData"
-      }
+      "headers": ZKILLBOARD_HEADERS
     });
 
     const rawResponse = response.getContentText();
@@ -579,9 +594,7 @@ function getCharacterBirthday(characterId) {
     const url = `https://esi.evetech.net/latest/characters/${characterId}/`;
     const response = UrlFetchApp.fetch(url, {
       muteHttpExceptions: true,
-      headers: {
-        "User-Agent": "GoogleAppsScript-EVEDataFetcher"
-      }
+      headers: ESI_HEADERS
     });
     
     if (response.getResponseCode() !== 200) {
@@ -715,26 +728,19 @@ function fetchEsiDetailsForZkillData(zkillData, referenceMaps) {
 function importOrUpdateUniverseData() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  const urls = {
-    solar: "https://www.fuzzwork.co.uk/dump/latest/mapSolarSystems.csv",
-    regions: "https://www.fuzzwork.co.uk/dump/latest/mapRegions.csv",
-    invTypes: "https://www.fuzzwork.co.uk/dump/latest/invTypes.csv",
-    invGroups: "https://www.fuzzwork.co.uk/dump/latest/invGroups.csv"
-  };
-
   let updatedCount = 0;
   let skippedCount = 0;
 
-  if (importCsvToSheet(urls.solar, "solar_systems", ss)) updatedCount++;
+  if (importCsvToSheet(CSV_URLS.solar, "solar_systems", ss)) updatedCount++;
   else skippedCount++;
   
-  if (importCsvToSheet(urls.regions, "regions", ss)) updatedCount++;
+  if (importCsvToSheet(CSV_URLS.regions, "regions", ss)) updatedCount++;
   else skippedCount++;
   
-  if (importCsvToSheet(urls.invTypes, "invTypes", ss)) updatedCount++;
+  if (importCsvToSheet(CSV_URLS.invTypes, "invTypes", ss)) updatedCount++;
   else skippedCount++;
   
-  if (importCsvToSheet(urls.invGroups, "invGroups", ss)) updatedCount++;
+  if (importCsvToSheet(CSV_URLS.invGroups, "invGroups", ss)) updatedCount++;
   else skippedCount++;
 
   Logger.log(`Finished importing universe data. Updated: ${updatedCount}, Skipped (unchanged): ${skippedCount}`);
