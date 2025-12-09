@@ -23,7 +23,7 @@
 // Maximum number of pages to fetch from zkillboard (zkillboard max is 20 pages)
 // Change this value for debugging/testing purposes
 const MAX_PAGES = 20;
-const CHARACTER_ID = '94510470';
+const CHARACTER_ID = '2119131489'; // Jeff Kali for testing - has around 100 solo kills
 
 // API and processing timing constants (in milliseconds)
 const API_CALL_PAUSE_MS = 100;      // Pause between API calls
@@ -352,19 +352,38 @@ function fetchZkillUpdate() {
 // ============================================================================
 
 /**
- * Generates an array of year/month combinations from current date back to May 2003
+ * Generates an array of year/month combinations from current date back to character's birthday
+ * @param {string} characterId - Optional: Character ID to fetch birthday for (defaults to CHARACTER_ID constant)
  * @return {Array} Array of objects with {year, month} properties
  */
-function generateYearMonthCombinations() {
+function generateYearMonthCombinations(characterId = CHARACTER_ID) {
   const combinations = [];
   const now = new Date();
   const currentYear = now.getFullYear();
   const currentMonth = now.getMonth() + 1; // getMonth() returns 0-11
   
-  // Start from current year/month and go back to May 2003
-  for (let year = currentYear; year >= 2003; year--) {
+  // Get character birthday from ESI API
+  const birthdayStr = getCharacterBirthday(characterId);
+  let birthYear = 2003;
+  let birthMonth = 5; // Default to May 2003 if birthday can't be fetched
+  
+  if (birthdayStr) {
+    try {
+      const birthDate = new Date(birthdayStr);
+      birthYear = birthDate.getFullYear();
+      birthMonth = birthDate.getMonth() + 1; // getMonth() returns 0-11
+      Logger.log(`Using character birthday: ${birthYear}-${birthMonth.toString().padStart(2, '0')}`);
+    } catch (e) {
+      Logger.log(`Error parsing character birthday '${birthdayStr}': ${e.toString()}, defaulting to May 2003`);
+    }
+  } else {
+    Logger.log(`Could not fetch character birthday, defaulting to May 2003`);
+  }
+  
+  // Start from current year/month and go back to character's birthday
+  for (let year = currentYear; year >= birthYear; year--) {
     const startMonth = (year === currentYear) ? currentMonth : 12;
-    const endMonth = (year === 2003) ? 5 : 1; // Stop at May 2003
+    const endMonth = (year === birthYear) ? birthMonth : 1;
     
     for (let month = startMonth; month >= endMonth; month--) {
       combinations.push({ year, month });
@@ -556,6 +575,34 @@ function loadReferenceDataMaps() {
 // ============================================================================
 // ESI DETAIL FETCHING
 // ============================================================================
+
+/**
+ * Fetches character birthday from EVE ESI API
+ * @param {string} characterId - The EVE character ID (defaults to CHARACTER_ID constant)
+ * @return {string|null} Character birthday as ISO 8601 date string, or null if error
+ */
+function getCharacterBirthday(characterId = CHARACTER_ID) {
+  try {
+    const url = `https://esi.evetech.net/latest/characters/${characterId}/`;
+    const response = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true,
+      headers: {
+        "User-Agent": "GoogleAppsScript-EVEDataFetcher"
+      }
+    });
+    
+    if (response.getResponseCode() !== 200) {
+      Logger.log(`Error fetching character ${characterId}: HTTP ${response.getResponseCode()}`);
+      return null;
+    }
+    
+    const characterData = JSON.parse(response.getContentText());
+    return characterData.birthday || null;
+  } catch (e) {
+    Logger.log(`Error fetching character birthday for ${characterId}: ${e.toString()}`);
+    return null;
+  }
+}
 
 /**
  * Fetches ESI details for zkill data and combines them into complete rows
