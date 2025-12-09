@@ -133,9 +133,9 @@ function fetchZkillInitial() {
   let totalSkipped = 0;
   let yearMonthCombosProcessed = 0;
   
-  // Generate year/month combinations from current date back to May 2003
-  const yearMonthCombinations = generateYearMonthCombinations();
-  Logger.log(`Processing ${yearMonthCombinations.length} year/month combinations (from current to May 2003)`);
+  // Generate year/month combinations from current date back to character's birthday
+  const yearMonthCombinations = generateYearMonthCombinations(CHARACTER_ID);
+  Logger.log(`Processing ${yearMonthCombinations.length} year/month combinations (from current to character's birthday)`);
   
   // Loop through each year/month combination
   for (const { year, month } of yearMonthCombinations) {
@@ -271,7 +271,7 @@ function fetchZkillUpdate() {
   
   // Generate year/month combinations from current date going backwards
   // Will stop when an existing killmail is found
-  const yearMonthCombinations = generateYearMonthCombinations();
+  const yearMonthCombinations = generateYearMonthCombinations(CHARACTER_ID);
   Logger.log(`Checking months for new killmails (will stop when existing killmail is found)`);
   
   // Loop through year/month combinations (newest first)
@@ -353,10 +353,10 @@ function fetchZkillUpdate() {
 
 /**
  * Generates an array of year/month combinations from current date back to character's birthday
- * @param {string} characterId - Optional: Character ID to fetch birthday for (defaults to CHARACTER_ID constant)
+ * @param {string} characterId - Character ID to fetch birthday for
  * @return {Array} Array of objects with {year, month} properties
  */
-function generateYearMonthCombinations(characterId = CHARACTER_ID) {
+function generateYearMonthCombinations(characterId) {
   const combinations = [];
   const now = new Date();
   const currentYear = now.getFullYear();
@@ -394,20 +394,15 @@ function generateYearMonthCombinations(characterId = CHARACTER_ID) {
 }
 
 /**
- * Fetches a single page from zkillboard API with optional year and month filters
+ * Fetches a single page from zkillboard API with year and month filters
  * @param {string} characterID - The EVE character ID
  * @param {number} pageNum - The page number to fetch (1-20)
- * @param {number} year - Optional: Year to filter by (e.g., 2025)
- * @param {number} month - Optional: Month to filter by (1-12)
+ * @param {number} year - Year to filter by (e.g., 2025)
+ * @param {number} month - Month to filter by (1-12)
  * @return {Object} Object with 'rows' (Array of row arrays) and 'rawResponse' (string) properties
  */
-function fetchZKillboardPage(characterID, pageNum, year = null, month = null) {
-  let API_URL = `https://zkillboard.com/api/kills/characterID/${characterID}/solo/page/${pageNum}/`;
-
-  // Add year and month parameters if provided
-  if (year && month) {
-    API_URL = `https://zkillboard.com/api/kills/characterID/${characterID}/solo/page/${pageNum}/year/${year}/month/${month}/`;
-  }
+function fetchZKillboardPage(characterID, pageNum, year, month) {
+  const API_URL = `https://zkillboard.com/api/kills/characterID/${characterID}/solo/page/${pageNum}/year/${year}/month/${month}/`;
 
   try {
     const response = UrlFetchApp.fetch(API_URL, {
@@ -420,8 +415,7 @@ function fetchZKillboardPage(characterID, pageNum, year = null, month = null) {
     const rawResponse = response.getContentText();
 
     if (response.getResponseCode() !== 200) {
-      const yearMonthStr = (year && month) ? ` ${year}-${month.toString().padStart(2, '0')}` : '';
-      Logger.log(`Error fetching page ${pageNum}${yearMonthStr}: HTTP ${response.getResponseCode()}`);
+      Logger.log(`Error fetching page ${pageNum} ${year}-${month.toString().padStart(2, '0')}: HTTP ${response.getResponseCode()}`);
       return { rows: [], rawResponse: rawResponse };
     }
 
@@ -454,8 +448,7 @@ function fetchZKillboardPage(characterID, pageNum, year = null, month = null) {
 
     return { rows: rows, rawResponse: rawResponse };
   } catch (e) {
-    const yearMonthStr = (year && month) ? ` ${year}-${month.toString().padStart(2, '0')}` : '';
-    Logger.log(`Error processing page ${pageNum}${yearMonthStr}: ${e.toString()}`);
+    Logger.log(`Error processing page ${pageNum} ${year}-${month.toString().padStart(2, '0')}: ${e.toString()}`);
     return { rows: [], rawResponse: "" };
   }
 }
@@ -578,10 +571,10 @@ function loadReferenceDataMaps() {
 
 /**
  * Fetches character birthday from EVE ESI API
- * @param {string} characterId - The EVE character ID (defaults to CHARACTER_ID constant)
+ * @param {string} characterId - The EVE character ID
  * @return {string|null} Character birthday as ISO 8601 date string, or null if error
  */
-function getCharacterBirthday(characterId = CHARACTER_ID) {
+function getCharacterBirthday(characterId) {
   try {
     const url = `https://esi.evetech.net/latest/characters/${characterId}/`;
     const response = UrlFetchApp.fetch(url, {
@@ -609,17 +602,12 @@ function getCharacterBirthday(characterId = CHARACTER_ID) {
  * Also enriches data with reference information from CSV sheets (solar system names, ship names, etc.)
  * Processes killmails in batches to efficiently fetch details from EVE ESI API
  * @param {Array} zkillData - Array of zkill row arrays (without headers)
- * @param {Object} referenceMaps - Optional: Reference data maps from loadReferenceDataMaps()
+ * @param {Object} referenceMaps - Reference data maps from loadReferenceDataMaps()
  * @return {Array} Array of complete row arrays (zkill data + ESI details + reference data)
  */
-function fetchEsiDetailsForZkillData(zkillData, referenceMaps = null) {
+function fetchEsiDetailsForZkillData(zkillData, referenceMaps) {
   if (!zkillData || zkillData.length === 0) {
     return [];
-  }
-
-  // Load reference data if not provided
-  if (!referenceMaps) {
-    referenceMaps = loadReferenceDataMaps();
   }
 
   const BATCH_SIZE = ESI_BATCH_SIZE;
