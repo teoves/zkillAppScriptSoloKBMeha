@@ -96,6 +96,9 @@ function updateAllKillmailData() {
   
   // Step 2: Fetch all zkill data with ESI details (page-by-page)
   fetchZkillInitial();
+  
+  // Step 3: Set up daily trigger for automatic updates
+  setupDailyKillmailUpdateTrigger();
 }
 
 /**
@@ -109,6 +112,38 @@ function updateNewKillmails() {
   
   // Step 2: Fetch only new zkill data with ESI details (page-by-page)
   fetchZkillUpdate();
+}
+
+// ============================================================================
+// TRIGGER SETUP
+// ============================================================================
+
+/**
+ * Sets up a daily timed trigger to run updateNewKillmails at 3 AM local time
+ * Only creates the trigger if one doesn't already exist
+ */
+function setupDailyKillmailUpdateTrigger() {
+  // Get all existing triggers for this project
+  const triggers = ScriptApp.getProjectTriggers();
+  
+  // Check if a trigger already exists for updateNewKillmails
+  const existingTrigger = triggers.find(trigger => 
+    trigger.getHandlerFunction() === 'updateNewKillmails'
+  );
+  
+  if (existingTrigger) {
+    Logger.log('Daily killmail update trigger already exists - skipping creation');
+    return;
+  }
+  
+  // Create a new time-based trigger that runs daily at 3 AM
+  ScriptApp.newTrigger('updateNewKillmails')
+    .timeBased()
+    .atHour(3)  // 3 AM
+    .everyDays(1)  // Daily (24 hours)
+    .create();
+  
+  Logger.log('Created daily killmail update trigger: runs updateNewKillmails at 3 AM local time');
 }
 
 // ============================================================================
