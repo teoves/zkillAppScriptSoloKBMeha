@@ -1,0 +1,804 @@
+// ============================================================================
+// EVE Online Killmail Data Fetcher
+// ============================================================================
+// This script fetches killmail data from zkillboard.com and enriches it with
+// details from EVE ESI API. It also imports universe reference data from
+// fuzzwork.co.uk for lookups.
+//
+// Main Functions:
+//   - updateAllKillmailData(): Initial setup - fetches all killmails (up to 20 pages)
+//   - updateNewKillmails(): Incremental update - only fetches new killmails
+//
+// Data Flow:
+//   1. Import/update universe reference data (solar systems, regions, types, groups)
+//   2. Fetch zkillboard data page by page
+//   3. For each page, fetch ESI details and combine into complete rows
+//   4. Write to 'zkill' sheet with all data combined
+// ============================================================================
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Maximum number of pages to fetch from zkillboard (zkillboard max is 20 pages)
+// Change this value for debugging/testing purposes
+const MAX_PAGES = 20;
+const CHARACTER_ID = '94510470';
+
+// API and processing timing constants (in milliseconds)
+const API_CALL_PAUSE_MS = 100;      // Pause between API calls
+const SHEET_WRITE_PAUSE_MS = 100;    // Pause between sheet writes
+
+// ESI API batch processing
+const ESI_BATCH_SIZE = 50;           // Number of killmails to process per ESI API batch
+
+// Combined headers for zkill sheet: zkill data + ESI details + reference data
+const ZKILL_SHEET_HEADERS = [
+  // zkill columns (from zkillboard API)
+  "killmail_id",
+  "locationID",
+  "hash",
+  "fittedValue",
+  "droppedValue",
+  "destroyedValue",
+  "totalValue",
+  "points",
+  "npc",
+  "solo",
+  "awox",
+  "labels",
+  // ESI detail columns (from EVE ESI API)
+  "killmail_time",
+  "solar_system_id",
+  "solar_system_name",      // from CSV reference data
+  "region_id",              // from CSV reference data
+  "region_name",            // from CSV reference data
+  "victim_character_id",
+  "victim_ship_type_id",
+  "victim_ship_name",       // from CSV reference data
+  "victim_corporation_id",
+  "victim_alliance_id",
+  "total_attackers",
+  "final_blow_character_id",
+  "final_blow_ship_type_id",
+  "final_blow_ship_name"    // from CSV reference data
+];
+
+// ============================================================================
+// MAIN FUNCTIONS
+// ============================================================================
+
+/**
+ * Main function: Initial setup - fetches all killmails from zkillboard
+ * Fetches up to MAX_PAGES pages and enriches each killmail with ESI details
+ * Use this for the first time setup or to refresh all data
+ */
+function updateAllKillmailData() {
+  // Step 1: Update universe reference data (solar systems, regions, invTypes, invGroups)
+  importOrUpdateUniverseData();
+  
+  // Step 2: Fetch all zkill data with ESI details (page-by-page)
+  fetchZkillInitial();
+}
+
+/**
+ * Main function: Incremental update - only fetches new killmails
+ * Checks existing killmails and only adds new ones from zkillboard
+ * Use this for regular updates to avoid re-fetching existing data
+ */
+function updateNewKillmails() {
+  // Step 1: Update universe reference data (solar systems, regions, invTypes, invGroups)
+  importOrUpdateUniverseData();
+  
+  // Step 2: Fetch only new zkill data with ESI details (page-by-page)
+  fetchZkillUpdate();
+}
+
+// ============================================================================
+// ZKILL DATA FETCHING
+// ============================================================================
+
+/**
+ * Initial fetch: Pulls all pages from zkillboard (up to MAX_PAGES)
+ * Fetches zkill data and ESI details page-by-page, then writes to sheet
+ * Skips killmail IDs that have already been fetched (can resume if execution times out)
+ */
+function fetchZkillInitial() {
+  const SHEET_NAME = "zkill";
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET_NAME);
+    Logger.log(`Created sheet '${SHEET_NAME}'`);
+  }
+  
+  // Write headers once if sheet is empty
+  const lastRow = sheet.getLastRow();
+  if (lastRow === 0) {
+    sheet.getRange(1, 1, 1, ZKILL_SHEET_HEADERS.length).setValues([ZKILL_SHEET_HEADERS]);
+    Logger.log("Wrote headers to sheet");
+  }
+  
+  // Get existing killmail IDs once from the sheet
+  const existingIds = getExistingKillmailIds(sheet);
+  Logger.log(`Found ${existingIds.size} existing killmails in sheet - will skip duplicates`);
+  
+  // Load reference data once (solar systems, ship types, regions)
+  Logger.log("Loading reference data from CSV sheets...");
+  const referenceMaps = loadReferenceDataMaps();
+  
+  let pagesProcessed = 0;
+  let totalKillmailsAdded = 0;
+  let totalSkipped = 0;
+  let yearMonthCombosProcessed = 0;
+  
+  // Generate year/month combinations from current date back to May 2003
+  const yearMonthCombinations = generateYearMonthCombinations();
+  Logger.log(`Processing ${yearMonthCombinations.length} year/month combinations (from current to May 2003)`);
+  
+  // Loop through each year/month combination
+  for (const { year, month } of yearMonthCombinations) {
+    Logger.log(`\n=== Processing ${year}-${month.toString().padStart(2, '0')} ===`);
+    yearMonthCombosProcessed++;
+    
+    let hasDataForMonth = false;
+    
+    // Fetch all pages for this year/month (up to MAX_PAGES)
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      Logger.log(`Fetching ${year}-${month.toString().padStart(2, '0')} page ${page}...`);
+      
+      // Fetch zkill data for this page with year/month filter
+      const zkillPageResult = fetchZKillboardPage(CHARACTER_ID, page, year, month);
+      const zkillPageData = zkillPageResult.rows;
+      
+      // Pause between API calls
+      Utilities.sleep(API_CALL_PAUSE_MS);
+      
+      if (zkillPageData.length === 0) {
+        // If no data on first page, this month has no killmails
+        if (page === 1) {
+          Logger.log(`No data for ${year}-${month.toString().padStart(2, '0')}, moving to next month`);
+          break;
+        }
+        // If no data on later page, we've reached the end for this month
+        Logger.log(`No more data for ${year}-${month.toString().padStart(2, '0')} after page ${page - 1}`);
+        break;
+      }
+
+      hasDataForMonth = true;
+      
+      // Filter out killmails that already exist (before enriching with ESI/CSV data)
+      const newZkillKillmails = zkillPageData.filter(row => {
+        const killmailId = row[0]; // First column is killmail_id
+        return !existingIds.has(killmailId);
+      });
+      
+      const skippedOnPage = zkillPageData.length - newZkillKillmails.length;
+      totalSkipped += skippedOnPage;
+      
+      if (newZkillKillmails.length === 0) {
+        Logger.log(`${year}-${month.toString().padStart(2, '0')} page ${page}: All ${zkillPageData.length} killmails already exist, skipping`);
+        pagesProcessed++;
+        continue;
+      }
+      
+      Logger.log(`${year}-${month.toString().padStart(2, '0')} page ${page}: Found ${newZkillKillmails.length} new killmails (${skippedOnPage} already exist)`);
+      
+      // Fetch ESI details + reference data for new killmails on this page
+      const completePageRows = fetchEsiDetailsForZkillData(newZkillKillmails, referenceMaps);
+      
+      // Append rows to sheet
+      if (completePageRows.length > 0) {
+        const nextRow = sheet.getLastRow() + 1;
+        sheet.getRange(nextRow, 1, completePageRows.length, ZKILL_SHEET_HEADERS.length).setValues(completePageRows);
+        totalKillmailsAdded += completePageRows.length;
+        
+        // Update existingIds set with newly added killmails to avoid duplicates in subsequent pages
+        completePageRows.forEach(row => {
+          if (row && row[0]) existingIds.add(row[0]);
+        });
+        
+        Logger.log(`Added ${completePageRows.length} killmails to sheet`);
+        Logger.log(`Completed ${year}-${month.toString().padStart(2, '0')} page ${page}: ${completePageRows.length} killmails with full details`);
+        
+        // Pause between sheet writes
+        Utilities.sleep(SHEET_WRITE_PAUSE_MS);
+      }
+      
+      pagesProcessed++;
+    }
+    
+    if (!hasDataForMonth) {
+      Logger.log(`No killmails found for ${year}-${month.toString().padStart(2, '0')}`);
+    }
+    
+  }
+  
+  if (pagesProcessed > 0 || totalSkipped > 0) {
+    Logger.log(`\n=== Initial fetch complete ===`);
+    Logger.log(`Processed ${yearMonthCombosProcessed} year/month combinations`);
+    Logger.log(`Processed ${pagesProcessed} pages`);
+    Logger.log(`Added ${totalKillmailsAdded} new killmails, skipped ${totalSkipped} duplicates`);
+    Logger.log(`Total killmails in sheet: ${sheet.getLastRow() - 1}`);
+  } else {
+    Logger.log("No killmails found - all year/month combinations processed.");
+  }
+}
+
+/**
+ * Update fetch: Only fetches new killmails not already in the sheet
+ * Checks existing killmail IDs and stops when it finds existing ones
+ * Preserves existing data and only adds new killmails at the top
+ */
+function fetchZkillUpdate() {
+  const SHEET_NAME = "zkill";
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    Logger.log("Sheet 'zkill' not found!");
+    return;
+  }
+  
+  // Ensure headers are correct
+  const lastRow = sheet.getLastRow();
+  if (lastRow === 0) {
+    // Sheet is empty, set headers
+    sheet.getRange(1, 1, 1, ZKILL_SHEET_HEADERS.length).setValues([ZKILL_SHEET_HEADERS]);
+  } else {
+    // Check if headers match expected format
+    const currentHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    if (currentHeaders.length !== ZKILL_SHEET_HEADERS.length || 
+        !currentHeaders.includes("killmail_time")) {
+      // Headers don't match, update them
+      sheet.getRange(1, 1, 1, ZKILL_SHEET_HEADERS.length).setValues([ZKILL_SHEET_HEADERS]);
+      Logger.log("Updated sheet headers to include ESI detail columns");
+    }
+  }
+  
+  // Load reference data once (solar systems, ship types, regions)
+  Logger.log("Loading reference data from CSV sheets...");
+  const referenceMaps = loadReferenceDataMaps();
+  
+  // Get existing killmail IDs from the sheet
+  const existingIds = getExistingKillmailIds(sheet);
+  Logger.log(`Found ${existingIds.size} existing killmails in sheet`);
+  
+  const newCompleteRows = []; // Will contain zkill + ESI data + reference data
+  let foundExisting = false;
+  let pagesChecked = 0;
+  
+  // Generate year/month combinations from current date going backwards
+  // Will stop when an existing killmail is found
+  const yearMonthCombinations = generateYearMonthCombinations();
+  Logger.log(`Checking months for new killmails (will stop when existing killmail is found)`);
+  
+  // Loop through year/month combinations (newest first)
+  for (const { year, month } of yearMonthCombinations) {
+    if (foundExisting) break;
+    
+    Logger.log(`\n=== Checking ${year}-${month.toString().padStart(2, '0')} for new killmails ===`);
+    
+    // Fetch pages until we find existing killmails or reach max pages
+    for (let page = 1; page <= MAX_PAGES && !foundExisting; page++) {
+      pagesChecked++;
+      Logger.log(`Checking ${year}-${month.toString().padStart(2, '0')} page ${page}...`);
+      
+      // Fetch zkill data for this page with year/month filter
+      const zkillPageResult = fetchZKillboardPage(CHARACTER_ID, page, year, month);
+      const zkillPageData = zkillPageResult.rows;
+      
+      // Pause between API calls
+      Utilities.sleep(API_CALL_PAUSE_MS);
+
+      if (zkillPageData.length === 0) {
+        Logger.log(`No data on ${year}-${month.toString().padStart(2, '0')} page ${page}, moving to next month`);
+        break;
+      }
+
+      // Filter out killmails that already exist
+      const newZkillKillmails = zkillPageData.filter(row => {
+        const killmailId = row[0]; // First column is killmail_id
+        if (existingIds.has(killmailId)) {
+          foundExisting = true; // Found existing killmail, stop after this page
+          return false;
+        }
+        return true;
+      });
+
+      if (newZkillKillmails.length > 0) {
+        Logger.log(`${year}-${month.toString().padStart(2, '0')} page ${page}: Found ${newZkillKillmails.length} new killmails, fetching ESI details...`);
+        
+        // Fetch ESI details + reference data for new killmails on this page
+        const completeRows = fetchEsiDetailsForZkillData(newZkillKillmails, referenceMaps);
+        newCompleteRows.push(...completeRows);
+        
+        Logger.log(`${year}-${month.toString().padStart(2, '0')} page ${page}: Completed ${completeRows.length} killmails with full details`);
+      } else {
+        Logger.log(`${year}-${month.toString().padStart(2, '0')} page ${page}: All killmails already exist`);
+      }
+      
+      // If we found an existing killmail, we've reached the boundary
+      if (foundExisting) {
+        Logger.log(`Reached existing killmails on ${year}-${month.toString().padStart(2, '0')} page ${page}, stopping fetch.`);
+        break;
+      }
+    }
+  }
+  
+  // Append new rows to the sheet
+  if (newCompleteRows.length > 0) {
+    // Get existing data
+    const allData = sheet.getDataRange().getValues();
+    const headers = allData[0];
+    const existingData = allData.slice(1);
+    
+    // Combine new rows with existing (new rows first, then existing)
+    const combinedData = [headers, ...newCompleteRows, ...existingData];
+    
+    // Clear and rewrite sheet with combined data
+    sheet.clearContents();
+    sheet.getRange(1, 1, combinedData.length, headers.length).setValues(combinedData);
+    
+    Logger.log(`Update complete: Added ${newCompleteRows.length} new killmails with full details (checked ${pagesChecked} pages)`);
+  } else {
+    Logger.log(`No new killmails found (checked ${pagesChecked} pages)`);
+  }
+}
+
+// ============================================================================
+// ZKILLBOARD API FUNCTIONS
+// ============================================================================
+
+/**
+ * Generates an array of year/month combinations from current date back to May 2003
+ * @return {Array} Array of objects with {year, month} properties
+ */
+function generateYearMonthCombinations() {
+  const combinations = [];
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const currentMonth = now.getMonth() + 1; // getMonth() returns 0-11
+  
+  // Start from current year/month and go back to May 2003
+  for (let year = currentYear; year >= 2003; year--) {
+    const startMonth = (year === currentYear) ? currentMonth : 12;
+    const endMonth = (year === 2003) ? 5 : 1; // Stop at May 2003
+    
+    for (let month = startMonth; month >= endMonth; month--) {
+      combinations.push({ year, month });
+    }
+  }
+  
+  return combinations;
+}
+
+/**
+ * Fetches a single page from zkillboard API with optional year and month filters
+ * @param {string} characterID - The EVE character ID
+ * @param {number} pageNum - The page number to fetch (1-20)
+ * @param {number} year - Optional: Year to filter by (e.g., 2025)
+ * @param {number} month - Optional: Month to filter by (1-12)
+ * @return {Object} Object with 'rows' (Array of row arrays) and 'rawResponse' (string) properties
+ */
+function fetchZKillboardPage(characterID, pageNum, year = null, month = null) {
+  let API_URL = `https://zkillboard.com/api/kills/characterID/${characterID}/solo/page/${pageNum}/`;
+
+  // Add year and month parameters if provided
+  if (year && month) {
+    API_URL = `https://zkillboard.com/api/kills/characterID/${characterID}/solo/page/${pageNum}/year/${year}/month/${month}/`;
+  }
+
+  try {
+    const response = UrlFetchApp.fetch(API_URL, {
+      "muteHttpExceptions": true,
+      "headers": {
+        "User-Agent": "GoogleAppsScript-zKillboardData"
+      }
+    });
+
+    const rawResponse = response.getContentText();
+
+    if (response.getResponseCode() !== 200) {
+      const yearMonthStr = (year && month) ? ` ${year}-${month.toString().padStart(2, '0')}` : '';
+      Logger.log(`Error fetching page ${pageNum}${yearMonthStr}: HTTP ${response.getResponseCode()}`);
+      return { rows: [], rawResponse: rawResponse };
+    }
+
+    const data = JSON.parse(rawResponse);
+
+    if (!Array.isArray(data) || data.length === 0) {
+      return { rows: [], rawResponse: rawResponse };
+    }
+
+    // Build rows array
+    const rows = [];
+    data.forEach(kill => {
+      const zkb = kill.zkb || {};
+
+      rows.push([
+        kill.killmail_id,
+        zkb.locationID || "",
+        zkb.hash || "",
+        zkb.fittedValue || "",
+        zkb.droppedValue || "",
+        zkb.destroyedValue || "",
+        zkb.totalValue || "",
+        zkb.points || "",
+        zkb.npc || "",
+        zkb.solo || "",
+        zkb.awox || "",
+        Array.isArray(zkb.labels) ? zkb.labels.join(", ") : ""
+      ]);
+    });
+
+    return { rows: rows, rawResponse: rawResponse };
+  } catch (e) {
+    const yearMonthStr = (year && month) ? ` ${year}-${month.toString().padStart(2, '0')}` : '';
+    Logger.log(`Error processing page ${pageNum}${yearMonthStr}: ${e.toString()}`);
+    return { rows: [], rawResponse: "" };
+  }
+}
+
+
+/**
+ * Gets a Set of existing killmail IDs from the sheet
+ * Used to determine which killmails are already in the database
+ * @param {Sheet} sheet - The Google Sheet object
+ * @return {Set} Set of killmail IDs
+ */
+function getExistingKillmailIds(sheet) {
+  const existingIds = new Set();
+  const lastRow = sheet.getLastRow();
+  
+  if (lastRow < 2) {
+    return existingIds; // No data rows (only header or empty)
+  }
+  
+  // Get killmail_id column (column A, index 0)
+  const killmailIds = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  killmailIds.forEach(row => {
+    const id = row[0];
+    if (id) {
+      existingIds.add(id);
+    }
+  });
+  
+  return existingIds;
+}
+
+// ============================================================================
+// REFERENCE DATA LOADING
+// ============================================================================
+
+/**
+ * Loads reference data from CSV sheets into lookup maps for fast access
+ * @return {Object} Object containing lookup maps for different reference data
+ */
+function loadReferenceDataMaps() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const maps = {};
+  
+  // Load solar systems map (solarSystemID -> {solarSystemName, regionID, ...})
+  const solarSheet = ss.getSheetByName("solar_systems");
+  if (solarSheet && solarSheet.getLastRow() > 1) {
+    const solarData = solarSheet.getDataRange().getValues();
+    const solarHeaders = solarData[0];
+    const solarSystemIdIndex = solarHeaders.indexOf("solarSystemID");
+    const solarSystemNameIndex = solarHeaders.indexOf("solarSystemName");
+    const regionIdIndex = solarHeaders.indexOf("regionID");
+    
+    if (solarSystemIdIndex !== -1) {
+      maps.solarSystems = {};
+      for (let i = 1; i < solarData.length; i++) {
+        const row = solarData[i];
+        const id = row[solarSystemIdIndex];
+        if (id) {
+          maps.solarSystems[id] = {
+            name: solarSystemNameIndex !== -1 ? (row[solarSystemNameIndex] || "") : "",
+            regionID: regionIdIndex !== -1 ? (row[regionIdIndex] || "") : ""
+          };
+        }
+      }
+    }
+  }
+  
+  // Load ship types map (typeID -> {typeName, groupID, ...})
+  const invTypesSheet = ss.getSheetByName("invTypes");
+  if (invTypesSheet && invTypesSheet.getLastRow() > 1) {
+    const invTypesData = invTypesSheet.getDataRange().getValues();
+    const invTypesHeaders = invTypesData[0];
+    const typeIdIndex = invTypesHeaders.indexOf("typeID");
+    const typeNameIndex = invTypesHeaders.indexOf("typeName");
+    const groupIdIndex = invTypesHeaders.indexOf("groupID");
+    
+    if (typeIdIndex !== -1) {
+      maps.shipTypes = {};
+      for (let i = 1; i < invTypesData.length; i++) {
+        const row = invTypesData[i];
+        const id = row[typeIdIndex];
+        if (id) {
+          maps.shipTypes[id] = {
+            name: typeNameIndex !== -1 ? (row[typeNameIndex] || "") : "",
+            groupID: groupIdIndex !== -1 ? (row[groupIdIndex] || "") : ""
+          };
+        }
+      }
+    }
+  }
+  
+  // Load regions map (regionID -> {regionName, ...})
+  const regionsSheet = ss.getSheetByName("regions");
+  if (regionsSheet && regionsSheet.getLastRow() > 1) {
+    const regionsData = regionsSheet.getDataRange().getValues();
+    const regionsHeaders = regionsData[0];
+    const regionIdIndex = regionsHeaders.indexOf("regionID");
+    const regionNameIndex = regionsHeaders.indexOf("regionName");
+    
+    if (regionIdIndex !== -1) {
+      maps.regions = {};
+      for (let i = 1; i < regionsData.length; i++) {
+        const row = regionsData[i];
+        const id = row[regionIdIndex];
+        if (id) {
+          maps.regions[id] = {
+            name: regionNameIndex !== -1 ? (row[regionNameIndex] || "") : ""
+          };
+        }
+      }
+    }
+  }
+  
+  return maps;
+}
+
+// ============================================================================
+// ESI DETAIL FETCHING
+// ============================================================================
+
+/**
+ * Fetches ESI details for zkill data and combines them into complete rows
+ * Also enriches data with reference information from CSV sheets (solar system names, ship names, etc.)
+ * Processes killmails in batches to efficiently fetch details from EVE ESI API
+ * @param {Array} zkillData - Array of zkill row arrays (without headers)
+ * @param {Object} referenceMaps - Optional: Reference data maps from loadReferenceDataMaps()
+ * @return {Array} Array of complete row arrays (zkill data + ESI details + reference data)
+ */
+function fetchEsiDetailsForZkillData(zkillData, referenceMaps = null) {
+  if (!zkillData || zkillData.length === 0) {
+    return [];
+  }
+
+  // Load reference data if not provided
+  if (!referenceMaps) {
+    referenceMaps = loadReferenceDataMaps();
+  }
+
+  const BATCH_SIZE = ESI_BATCH_SIZE;
+  const completeRows = [];
+
+  // Process in batches
+  for (let start = 0; start < zkillData.length; start += BATCH_SIZE) {
+    const batch = zkillData.slice(start, start + BATCH_SIZE);
+
+    // Prepare ESI requests
+    const requests = batch.map(row => {
+      const killmail_id = row[0]; // killmail_id is first column
+      const hash = row[2]; // hash is third column (index 2)
+      if (!killmail_id || !hash) return null;
+      return { 
+        url: `https://esi.evetech.net/latest/killmails/${killmail_id}/${hash}/`, 
+        muteHttpExceptions: true 
+      };
+    }).filter(r => r !== null);
+
+    if (requests.length === 0) continue;
+
+    // Fetch all ESI details for this batch
+    const responses = UrlFetchApp.fetchAll(requests);
+
+    let responseIndex = 0;
+    batch.forEach(row => {
+      const killmail_id = row[0];
+      const hash = row[2];
+      
+      if (!killmail_id || !hash) {
+        // If missing required data, create row with empty ESI details + reference data (13 columns now)
+        completeRows.push([...row, ...new Array(13).fill("")]);
+        return;
+      }
+
+      const resp = responses[responseIndex++];
+      try {
+        if (resp.getResponseCode() !== 200) {
+          Logger.log(`Error fetching killmail ${killmail_id}: HTTP ${resp.getResponseCode()}`);
+          // Add row with error indicator (13 columns: 2 for error, 11 empty)
+          completeRows.push([...row, "ERROR", resp.getResponseCode().toString(), ...new Array(11).fill("")]);
+          return;
+        }
+
+        const km = JSON.parse(resp.getContentText());
+        const victim = km.victim || {};
+        const attackers = km.attackers || [];
+        const finalBlow = attackers.find(a => a.final_blow) || {};
+
+        // Get IDs for reference lookups
+        const solarSystemId = km.solar_system_id || "";
+        const victimShipTypeId = victim.ship_type_id || "";
+        const finalBlowShipTypeId = finalBlow.ship_type_id || "";
+
+        // Look up reference data
+        const solarSystem = referenceMaps.solarSystems && solarSystemId ? referenceMaps.solarSystems[solarSystemId] : null;
+        const victimShip = referenceMaps.shipTypes && victimShipTypeId ? referenceMaps.shipTypes[victimShipTypeId] : null;
+        const finalBlowShip = referenceMaps.shipTypes && finalBlowShipTypeId ? referenceMaps.shipTypes[finalBlowShipTypeId] : null;
+        const region = solarSystem && solarSystem.regionID && referenceMaps.regions ? referenceMaps.regions[solarSystem.regionID] : null;
+
+        // Combine zkill row with ESI details + reference data
+        const esiDetails = [
+          km.killmail_time || "",
+          km.solar_system_id || "",
+          solarSystem ? solarSystem.name : "", // solar_system_name
+          solarSystem ? solarSystem.regionID : "", // region_id
+          region ? region.name : "", // region_name
+          victim.character_id || "",
+          victim.ship_type_id || "",
+          victimShip ? victimShip.name : "", // victim_ship_name
+          victim.corporation_id || "",
+          victim.alliance_id || "",
+          attackers.length || "",
+          finalBlow.character_id || "",
+          finalBlow.ship_type_id || "",
+          finalBlowShip ? finalBlowShip.name : "" // final_blow_ship_name
+        ];
+
+        // Combine zkill data row with ESI details + reference data
+        completeRows.push([...row, ...esiDetails]);
+      } catch (e) {
+        Logger.log(`Error parsing killmail ${killmail_id}: ${e.toString()}`);
+        // Add row with error indicator (13 columns: 2 for error, 11 empty)
+        completeRows.push([...row, "ERROR", e.toString(), ...new Array(11).fill("")]);
+      }
+    });
+
+    // Pause between API calls (batches)
+    Utilities.sleep(API_CALL_PAUSE_MS);
+  }
+
+  return completeRows;
+}
+
+// ============================================================================
+// UNIVERSE DATA IMPORT
+// ============================================================================
+
+/**
+ * Imports or updates universe reference data from fuzzwork.co.uk
+ * Only updates sheets if the CSV files have changed since last import
+ * Creates sheets if they don't exist
+ */
+function importOrUpdateUniverseData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const urls = {
+    solar: "https://www.fuzzwork.co.uk/dump/latest/mapSolarSystems.csv",
+    regions: "https://www.fuzzwork.co.uk/dump/latest/mapRegions.csv",
+    invTypes: "https://www.fuzzwork.co.uk/dump/latest/invTypes.csv",
+    invGroups: "https://www.fuzzwork.co.uk/dump/latest/invGroups.csv"
+  };
+
+  let updatedCount = 0;
+  let skippedCount = 0;
+
+  if (importCsvToSheet(urls.solar, "solar_systems", ss)) updatedCount++;
+  else skippedCount++;
+  
+  if (importCsvToSheet(urls.regions, "regions", ss)) updatedCount++;
+  else skippedCount++;
+  
+  if (importCsvToSheet(urls.invTypes, "invTypes", ss)) updatedCount++;
+  else skippedCount++;
+  
+  if (importCsvToSheet(urls.invGroups, "invGroups", ss)) updatedCount++;
+  else skippedCount++;
+
+  Logger.log(`Finished importing universe data. Updated: ${updatedCount}, Skipped (unchanged): ${skippedCount}`);
+}
+
+/**
+ * Imports CSV data to a sheet, but only if the file has changed since last import
+ * @param {string} url - The URL of the CSV file
+ * @param {string} sheetName - The name of the sheet to import into
+ * @param {Spreadsheet} ss - The spreadsheet object
+ * @return {boolean} True if data was imported, false if skipped (unchanged)
+ */
+function importCsvToSheet(url, sheetName, ss) {
+  const properties = PropertiesService.getScriptProperties();
+  const urlKey = `csv_etag_${url}`;
+  const lastModifiedKey = `csv_lastmod_${url}`;
+
+  // Check if sheet exists - if not, we need to import regardless of file changes
+  let sheet = ss.getSheetByName(sheetName);
+  const sheetExists = sheet !== null;
+  
+  if (!sheetExists) {
+    Logger.log(`Sheet '${sheetName}' does not exist, will import data`);
+  }
+
+  // Fetch the file (we need to download to check headers)
+  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  if (resp.getResponseCode() !== 200) {
+    Logger.log(`Failed to fetch URL: ${url}`);
+    return false;
+  }
+
+  // Check headers to see if file has changed
+  const headers = resp.getHeaders();
+  const etag = headers['ETag'] || headers['etag'];
+  const lastModified = headers['Last-Modified'] || headers['last-modified'];
+  
+  const lastEtag = properties.getProperty(urlKey);
+  const storedLastModified = properties.getProperty(lastModifiedKey);
+  
+  let hasChanged = true;
+  
+  // Only check for changes if sheet exists (if sheet doesn't exist, we import anyway)
+  if (sheetExists) {
+    // Check ETag first (more reliable)
+    if (etag && lastEtag && etag === lastEtag) {
+      hasChanged = false;
+      Logger.log(`Skipping ${sheetName}: File unchanged (ETag match)`);
+    } 
+    // Check Last-Modified as fallback if ETag not available
+    else if (!etag && lastModified && storedLastModified) {
+      const lastModifiedDate = new Date(lastModified).getTime().toString();
+      if (lastModifiedDate === storedLastModified) {
+        hasChanged = false;
+        Logger.log(`Skipping ${sheetName}: File unchanged (Last-Modified match)`);
+      }
+    }
+  }
+
+  // If file hasn't changed AND sheet exists, skip processing
+  if (!hasChanged && sheetExists) {
+    return false;
+  }
+
+  // File has changed, store the new ETag and Last-Modified
+  if (etag) {
+    properties.setProperty(urlKey, etag);
+  }
+  if (lastModified) {
+    properties.setProperty(lastModifiedKey, new Date(lastModified).getTime().toString());
+  }
+
+  const csv = resp.getContentText();
+
+  // --- Parse the entire CSV at once (correct way) ---
+  let rows;
+  try {
+    rows = Utilities.parseCsv(csv);
+  } catch (err) {
+    Logger.log(`CSV parse failed for URL: ${url}`);
+    Logger.log(err);
+    return false;
+  }
+
+  if (!rows || rows.length === 0) {
+    Logger.log(`No rows parsed for: ${url}`);
+    return false;
+  }
+
+  // --- Write to sheet ---
+  // Create sheet if it doesn't exist (shouldn't happen if we checked earlier, but just in case)
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+    Logger.log(`Created sheet '${sheetName}'`);
+  }
+  sheet.clearContents();
+
+  sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+
+  Logger.log(`Imported ${rows.length} rows into ${sheetName}`);
+  return true;
+}
